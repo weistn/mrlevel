@@ -28,29 +28,73 @@ func TestMRLevel(t *testing.T) {
 		mapcount++
 		ingredients := strings.Split(string(value), ",")
 		for _, ingredient := range ingredients {
-			println("emit", ingredient, string(key))
+//			println("emit", ingredient, string(key))
 			emit([]byte(ingredient), key)
 		}
 	})
 
 	sub1.Put(wo, []byte("Sushi"), []byte("Fish,Rice"))
 	sub1.Put(wo, []byte("Forelle Blau"), []byte("Fish,Potatoes"))
-	sub1.Put(wo, []byte("Wiener Schnitzel"), []byte("Pig,Potatoes"))
+	sub1.Put(wo, []byte("Wiener Schnitzel"), []byte("Fish,Potatoes"))
 	sub1.Put(wo, []byte("Pulled Pork"), []byte("Pig,ColeSlaw"))
 
 	if mapcount != 4 {
 		t.Fatal(mapcount)
 	}
 
+	correct1 := []string{"Sushi", "Forelle Blau", "Wiener Schnitzel"}
 	it := task.NewIterator("Fish")
+	i := 0
 	for it.SeekToFirst(); it.Valid(); it.Next() {
-		println("Fish", string(it.Key()), string(it.Value()))
+		if string(it.Value()) != correct1[i] {
+			t.Fatal(it.Value())
+		}
+		i++
+	}
+	if i != len(correct1) {
+		t.Fatal(i)
 	}
 
+	sub1.Put(wo, []byte("Wiener Schnitzel"), []byte("Pig,Potatoes"))
+
+	if mapcount != 5 {
+		t.Fatal(mapcount)
+	}
+
+	correct2 := []string{"Sushi", "Forelle Blau"}
+	i = 0
+	it = task.NewIterator("Fish")
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		if string(it.Value()) != correct2[i] {
+			t.Fatal(it.Value())
+		}
+		i++
+	}
+	if i != len(correct2) {
+		t.Fatal(i)
+	}
+
+	correct3 := []string{"Sushi"}
+	sub1.Delete(wo, []byte("Forelle Blau"))
+
+	it = task.NewIterator("Fish")
+	i = 0
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		if string(it.Value()) != correct3[i] {
+			t.Fatal(it.Value())
+		}
+		i++
+	}
+	if i != len(correct3) {
+		t.Fatal(i)
+	}
+
+/*
 	it2 := db.NewIterator(ro)
 	for it2.SeekToFirst(); it2.Valid(); it2.Next() {
 		println("DB", len(it2.Key()), string(it2.Key()), string(it2.Value()))
 	}
+*/
 
 	task.Close()
 

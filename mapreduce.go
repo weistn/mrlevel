@@ -75,7 +75,7 @@ func Map(source *sublevel.DB, target *sublevel.DB, name string, mapFunc MappingF
 				if l < 0 || int(l) > len(val) {
 					panic("Something is very wrong with this data")
 				}
-				k := val[off:off+int(l)]
+				k := valbuf.Next(int(l))
 				off += int(l)
 				hook.Delete(k, target)
 			}
