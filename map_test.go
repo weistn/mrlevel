@@ -28,6 +28,7 @@ func TestMRLevel(t *testing.T) {
 		mapcount++
 		ingredients := strings.Split(string(value), ",")
 		for _, ingredient := range ingredients {
+			println("emit", ingredient, string(key))
 			emit([]byte(ingredient), key)
 		}
 	})
@@ -40,7 +41,17 @@ func TestMRLevel(t *testing.T) {
 	if mapcount != 4 {
 		t.Fatal(mapcount)
 	}
-	
+
+	it := task.NewIterator("Fish")
+	for it.SeekToFirst(); it.Valid(); it.Next() {
+		println("Fish", string(it.Key()), string(it.Value()))
+	}
+
+	it2 := db.NewIterator(ro)
+	for it2.SeekToFirst(); it2.Valid(); it2.Next() {
+		println("DB", len(it2.Key()), string(it2.Key()), string(it2.Value()))
+	}
+
 	task.Close()
 
 	ro.Close()
