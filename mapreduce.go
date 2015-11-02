@@ -25,6 +25,7 @@ type MappingTask struct {
 	target *sublevel.DB
 	taskDb *sublevel.DB
 	ro *levigo.ReadOptions
+	wo *levigo.WriteOptions
 }
 
 type ReduceTask struct {
@@ -56,18 +57,19 @@ type mapIterator struct {
 func Map(source *sublevel.DB, target *sublevel.DB, name string, mapFunc MappingFunc) *MappingTask {
 	task := &MappingTask{source: source, target: target, taskDb: sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,65})), mapFunc: mapFunc}
 	task.ro = levigo.NewReadOptions()
+	task.wo = levigo.NewWriteOptions()
 
 	filter := func(key, value []byte) []byte {
 		return key
 	}
 
-	f := func(key, value []byte, hook *sublevel.Hook) bool {
+	f := func(key, value []byte) bool {
 		mapValues := new(bytes.Buffer)
 		if value != nil {
 			emit := func(key interface{}, value interface{}) {
 				k := serializeKey(key, uniclock.Next())
 				v := serializeValue(value)
-				hook.Put(k, v, task.target)
+				task.target.Put(task.wo, k, v)
 				binary.Write(mapValues, binary.BigEndian, int32(len(k)))
 				mapValues.Write(k)
 			}
@@ -92,14 +94,14 @@ func Map(source *sublevel.DB, target *sublevel.DB, name string, mapFunc MappingF
 				}
 				k := valbuf.Next(int(l))
 				off += int(l)
-				hook.Delete(k, target)
+				task.target.Delete(task.wo, k)
 			}
 		}
-		hook.Put(key, mapValues.Bytes(), task.taskDb)
+		task.taskDb.Put(task.wo, key, mapValues.Bytes())
 		return true
 	}
 
-	task.task = runlevel.TriggerBefore(source, sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,66})), filter, f)
+	task.task = runlevel.Trigger(source, sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,66})), filter, f)
 	return task
 }
 
@@ -142,22 +144,14 @@ func Reduce(source *sublevel.DB, target *sublevel.DB, name string, reduceFunc Re
 		*/
 	}
 
-	f := func(key, value []byte) {
-		println("Working on", string(key), string(value))
+	f := func(key, value []byte) bool {
+//		println("Working on", string(key), string(value))
 		s := bytes.Split(key[4:len(key)-17], []byte{32})
 		off := 16
 		for i := len(s); i >= task.level; i-- {
 			val := task.valueFactory()
 			if i > 0 {
 				k := append(joinReduceKey(s[:i], false), 32)
-				// k := key[:len(key) - off]
-				// DEBUG
-//				if i > 0 {
-//					dec := make([]byte, len(k))
-//					ndest, _, _ := ascii85.Decode(dec, s[i-1], true)
-//					println("Looking for", string(s[i-1]), string(dec[:ndest]))
-//				}
-//				println(string(k))
 				// Iterate over all similar rows in the source DB
 				it := task.source.NewIterator(task.ro)
 				for it.Seek(k); it.Valid(); it.Next() {
@@ -182,10 +176,11 @@ func Reduce(source *sublevel.DB, target *sublevel.DB, name string, reduceFunc Re
 			if i > 0 {
 				off += len(s[i - 1]) + 1
 			}
-		}				
+		}
+		return true	
 	}
 
-	task.task = runlevel.TriggerAfter(source, sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,66})), filter, f)
+	task.task = runlevel.Trigger(source, sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,66})), filter, f)
 	return task
 }
 
@@ -359,42 +354,6 @@ func ascii85Enc(src []byte) []byte {
 
 	return result[:n]
 }
-
-/*
-func serializeKey(keys interface{}, clock int64) []byte {
-	buf := new(bytes.Buffer)
-	if keys == nil {
-		buf.WriteByte(0)
-		binary.Write(buf, binary.BigEndian, clock)		
-		return buf.Bytes()
-	}
-	switch v := keys.(type) {
-	case []byte:
-		buf.Write(ascii85Enc(v))
-	case string:
-		buf.Write(ascii85Enc([]byte(v)))
-	case [][]byte:
-		for i, s := range v {
-			buf.Write(ascii85Enc(s))
-			if i + 1 < len(v) {
-				buf.WriteByte(32)
-			}
-		}		
-	case []string:
-		for i, s := range v {
-			buf.Write(ascii85Enc([]byte(s)))
-			if i + 1 < len(v) {
-				buf.WriteByte(32)
-			}
-		}
-	default:
-		panic("Unsupported key type")
-	}
-	buf.WriteByte(0)
-	fmt.Fprintf(buf, "%016x", clock)
-	return buf.Bytes()
-}
-*/
 
 func serializeKey(keys interface{}, clock int64) []byte {
 	buf := new(bytes.Buffer)
