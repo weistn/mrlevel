@@ -6,13 +6,16 @@ import (
 	"github.com/weistn/runlevel"
 	"github.com/weistn/uniclock"
 	"encoding/binary"
+	"encoding/json"
+//	"encoding/ascii85"
 	"bytes"
+	"fmt"
 )
 
 type EmitFunc func(key interface{}, value interface{})
 type MappingFunc func(key, value []byte, emit EmitFunc)
-type ReduceFunc func(acc interface{}, value []byte)
-type RereduceFunc func(acc interface{}, value interface{})
+type ReduceFunc func(acc interface{}, value []byte) interface{}
+type RereduceFunc func(acc interface{}, value []byte) interface{}
 type ValueFactory func() interface{}
 
 type MappingTask struct {
@@ -26,9 +29,15 @@ type MappingTask struct {
 
 type ReduceTask struct {
 	task *runlevel.Task
+	source *sublevel.DB
+	target *sublevel.DB
+	taskDb *sublevel.DB
 	reduceFunc ReduceFunc
 	rereduceFunc RereduceFunc
 	valueFactory ValueFactory
+	level int
+	ro *levigo.ReadOptions
+	wo *levigo.WriteOptions
 }
 
 type mapIterator struct {
@@ -36,6 +45,12 @@ type mapIterator struct {
 	prefix []byte
 	valid bool
 }
+
+/**************************************************************
+ *
+ * MappingTask
+ *
+ **************************************************************/
 
 
 func Map(source *sublevel.DB, target *sublevel.DB, name string, mapFunc MappingFunc) *MappingTask {
@@ -99,7 +114,93 @@ func (this *MappingTask) WorkOff() {
 
 func (this *MappingTask) NewIterator(key interface{}) sublevel.Iterator {
 	prefix := serializeKey(key, 1)
-	return &mapIterator{it: this.source.LevelDB().NewIterator(this.ro), prefix: append(append([]byte(this.target.Prefix()), 0), prefix[:len(prefix)-8]...), valid: false}
+	return &mapIterator{it: this.source.LevelDB().NewIterator(this.ro), prefix: append(append([]byte(this.target.Prefix()), 0), prefix[:len(prefix)-16]...), valid: false}
+}
+
+/**************************************************************
+ *
+ * ReduceTask
+ *
+ **************************************************************/
+
+func Reduce(source *sublevel.DB, target *sublevel.DB, name string, reduceFunc ReduceFunc, rereduceFunc RereduceFunc, valueFactory ValueFactory, level int) *ReduceTask {
+	task := &ReduceTask{source: source, target: target, taskDb: sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,65})), reduceFunc: reduceFunc, rereduceFunc: rereduceFunc, valueFactory: valueFactory, level: level}
+	task.ro = levigo.NewReadOptions()
+	task.wo = levigo.NewWriteOptions()
+
+	filter := func(key, value []byte) []byte {
+		return []byte{32}
+		/*
+		if task.level == 0 {
+			return []byte{0}
+		}
+		s := bytes.Split(key[:len(key)-17], []byte{32})
+		if len(s) < task.level {
+			return nil
+		}
+		return bytes.Join(s[:task.level], []byte{32})
+		*/
+	}
+
+	f := func(key, value []byte) {
+		println("Working on", string(key), string(value))
+		s := bytes.Split(key[4:len(key)-17], []byte{32})
+		off := 16
+		for i := len(s); i >= task.level; i-- {
+			val := task.valueFactory()
+			if i > 0 {
+				k := append(joinReduceKey(s[:i], false), 32)
+				// k := key[:len(key) - off]
+				// DEBUG
+//				if i > 0 {
+//					dec := make([]byte, len(k))
+//					ndest, _, _ := ascii85.Decode(dec, s[i-1], true)
+//					println("Looking for", string(s[i-1]), string(dec[:ndest]))
+//				}
+//				println(string(k))
+				// Iterate over all similar rows in the source DB
+				it := task.source.NewIterator(task.ro)
+				for it.Seek(k); it.Valid(); it.Next() {
+					if !bytes.HasPrefix(it.Key(), k) {
+						break
+					}
+					val = task.reduceFunc(val, it.Value())
+				}
+				it.Close()
+			}
+			// Iterate over all rows in the target DB which are more specific 
+			it := task.target.NewIterator(task.ro)
+			k := joinReduceKey(s[:i], true)
+			for it.Seek(k); it.Valid(); it.Next() {
+				if !bytes.HasPrefix(it.Key(), k) {
+					break
+				}
+				val = task.rereduceFunc(val, it.Value())
+			}
+			it.Close()
+			task.target.Put(task.wo, joinReduceKey(s[:i], false), serializeValue(val))
+			if i > 0 {
+				off += len(s[i - 1]) + 1
+			}
+		}				
+	}
+
+	task.task = runlevel.TriggerAfter(source, sublevel.Sublevel(target.LevelDB(), name + string([]byte{0,66})), filter, f)
+	return task
+}
+
+func (this *ReduceTask) Get(key interface{}) ([]byte, error) {
+	prefix := serializeKey(key, 1)
+	return this.target.Get(this.ro, prefix[:len(prefix)-9])
+}
+
+func (this *ReduceTask) Close() {
+	this.ro.Close()
+	this.task.Close()
+}
+
+func (this *ReduceTask) WorkOff() {
+	this.task.WorkOff()
 }
 
 /**************************************************************
@@ -206,16 +307,60 @@ func serializeValue(value interface{}) []byte {
 		return []byte{}
 	}
 	switch v := value.(type) {
-	case string:
-		return []byte(v)
 	case []byte:
 		return v
 	}
-	buf := new(bytes.Buffer)
-	binary.Write(buf, binary.BigEndian, value)
-	return buf.Bytes()
+	b, _ := json.Marshal(value)
+	return b
 }
 
+func ascii85Enc(src []byte) []byte {
+	result := make([]byte, (len(src) + 3) / 4 * 5)
+
+	dst := result
+	n := 0
+	for len(src) > 0 {
+		dst[0] = 0
+		dst[1] = 0
+		dst[2] = 0
+		dst[3] = 0
+		dst[4] = 0
+
+		var v uint32
+		switch len(src) {
+		default:
+			v |= uint32(src[3])
+			fallthrough
+		case 3:
+			v |= uint32(src[2]) << 8
+			fallthrough
+		case 2:
+			v |= uint32(src[1]) << 16
+			fallthrough
+		case 1:
+			v |= uint32(src[0]) << 24
+		}
+
+		for i := 4; i >= 0; i-- {
+			dst[i] = '!' + byte(v%85)
+			v /= 85
+		}
+
+		m := 5
+		if len(src) < 4 {
+			m -= 4 - len(src)
+			src = nil
+		} else {
+			src = src[4:]
+		}
+		dst = dst[m:]
+		n += m
+	}
+
+	return result[:n]
+}
+
+/*
 func serializeKey(keys interface{}, clock int64) []byte {
 	buf := new(bytes.Buffer)
 	if keys == nil {
@@ -225,54 +370,119 @@ func serializeKey(keys interface{}, clock int64) []byte {
 	}
 	switch v := keys.(type) {
 	case []byte:
-		buf.Write(v)
-		buf.WriteByte(0)		
-	case []string:
-		for _, s := range v {
-			buf.WriteString(s)
-			buf.WriteByte(0)
-		}
-	case []int8:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []int16:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []int32:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []int64:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []uint16:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []uint32:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
-	case []uint64:
-		for _, s := range v {
-			binary.Write(buf, binary.BigEndian, s)
-			buf.WriteByte(0)
-		}
+		buf.Write(ascii85Enc(v))
 	case string:
-		buf.WriteString(v)
+		buf.Write(ascii85Enc([]byte(v)))
+	case [][]byte:
+		for i, s := range v {
+			buf.Write(ascii85Enc(s))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}		
+	case []string:
+		for i, s := range v {
+			buf.Write(ascii85Enc([]byte(s)))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}
 	default:
-		binary.Write(buf, binary.BigEndian, v)
+		panic("Unsupported key type")
 	}
 	buf.WriteByte(0)
-	binary.Write(buf, binary.BigEndian, clock)
+	fmt.Fprintf(buf, "%016x", clock)
+	return buf.Bytes()
+}
+*/
+
+func serializeKey(keys interface{}, clock int64) []byte {
+	buf := new(bytes.Buffer)
+	if keys == nil {
+		fmt.Fprintf(buf, "%04x", 0)
+		buf.WriteByte(32)
+		binary.Write(buf, binary.BigEndian, clock)		
+		return buf.Bytes()
+	}
+	switch v := keys.(type) {
+	case []byte:
+		fmt.Fprintf(buf, "%04x", 1)
+		buf.Write(ascii85Enc(v))
+	case string:
+		fmt.Fprintf(buf, "%04x", 1)
+		buf.Write(ascii85Enc([]byte(v)))
+	case [][]byte:
+		fmt.Fprintf(buf, "%04x", len(v))
+		for i, s := range v {
+			buf.Write(ascii85Enc(s))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}		
+	case []string:
+		fmt.Fprintf(buf, "%04x", len(v))
+		for i, s := range v {
+			buf.Write(ascii85Enc([]byte(s)))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}
+	default:
+		panic("Unsupported key type")
+	}
+	buf.WriteByte(32)
+	fmt.Fprintf(buf, "%016x", clock)
+	return buf.Bytes()
+}
+
+
+func serializeReduceKey(keys interface{}) []byte {
+	buf := new(bytes.Buffer)
+	if keys == nil {
+		fmt.Fprintf(buf, "%04x", 0)
+		return buf.Bytes()
+	}
+	switch v := keys.(type) {
+	case []byte:
+		fmt.Fprintf(buf, "%04x", 1)
+		buf.Write(ascii85Enc(v))
+	case string:
+		fmt.Fprintf(buf, "%04x", 1)
+		buf.Write(ascii85Enc([]byte(v)))
+	case [][]byte:
+		fmt.Fprintf(buf, "%04x", len(v))
+		for i, s := range v {
+			buf.Write(ascii85Enc(s))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}		
+	case []string:
+		fmt.Fprintf(buf, "%04x", len(v))
+		for i, s := range v {
+			buf.Write(ascii85Enc([]byte(s)))
+			if i + 1 < len(v) {
+				buf.WriteByte(32)
+			}
+		}
+	default:
+		panic("Unsupported key type")
+	}
+	return buf.Bytes()
+}
+
+func joinReduceKey(encKeys [][]byte, next bool) []byte {
+	buf := new(bytes.Buffer)
+	if next {
+		fmt.Fprintf(buf, "%04x", len(encKeys) + 1)
+	} else {
+		fmt.Fprintf(buf, "%04x", len(encKeys))			
+	}
+	for i, s := range encKeys {
+		buf.Write(s)
+		if i + 1 < len(encKeys) || next {
+			buf.WriteByte(32)
+		}
+	}		
 	return buf.Bytes()
 }
